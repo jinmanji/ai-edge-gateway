@@ -1,0 +1,214 @@
+name: Release binaries
+
+on:
+  push:
+    branches: [main]
+    tags: ['v[0-9]*']
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUST_VERSION: '1.100.0'
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            libc: gnu
+            c_arch: x86-64
+            elf_machine: Advanced Micro Devices X86-64
+            platform: linux/amd64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            libc: gnu
+            c_arch: armv8-a
+            elf_machine: AArch64
+            platform: linux/arm64
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            libc: musl
+            c_arch: x86-64
+            elf_machine: Advanced Micro Devices X86-64
+            platform: linux/amd64
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            libc: musl
+            c_arch: armv8-a
+            elf_machine: AArch64
+            platform: linux/arm64
+    env:
+      TARGET: ${{ matrix.target }}
+      LIBC: ${{ matrix.libc }}
+      C_ARCH: ${{ matrix.c_arch }}
+      ELF_MACHINE: ${{ matrix.elf_machine }}
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - name: Check out the event commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Build and test GNU Linux
+        if: matrix.libc == 'gnu'
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target "$TARGET"
+          rustc "+$RUST_VERSION" --version
+          unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
+          export CFLAGS="-march=$C_ARCH" CXXFLAGS="-march=$C_ARCH"
+          cargo "+$RUST_VERSION" test --locked --target "$TARGET"
+          cargo "+$RUST_VERSION" build --locked --release --target "$TARGET"
+          python3 tests/smoke.py "target/$TARGET/release/ai-edge-gateway"
+
+      - name: Build static musl in Alpine and smoke test it
+        if: matrix.libc == 'musl'
+        shell: bash
+        run: |
+          docker run --rm --platform "$PLATFORM" \
+            --volume "$GITHUB_WORKSPACE:/work" --workdir /work \
+            --env TARGET --env C_ARCH --env CARGO_TERM_COLOR \
+            "rust:${RUST_VERSION}-alpine3.23" sh -euxc '
+              apk add --no-cache build-base cmake linux-headers perl pkgconf python3
+              rustc --version
+              test "$(rustc -vV | sed -n "s/^host: //p")" = "$TARGET"
+              unset CARGO_ENCODED_RUSTFLAGS
+              export RUSTFLAGS="-C target-feature=+crt-static"
+              export CFLAGS="-march=$C_ARCH" CXXFLAGS="-march=$C_ARCH"
+              cargo build --locked --release --target "$TARGET"
+              python3 tests/smoke.py "target/$TARGET/release/ai-edge-gateway"
+            '
+          # Exercise it with an unmodified Alpine userspace too (no compat packages).
+          docker run --rm --platform "$PLATFORM" --network none \
+            --volume "$GITHUB_WORKSPACE:/work:ro" --workdir /work \
+            alpine:3.23 "./target/$TARGET/release/ai-edge-gateway" --config config.example.toml --check
+
+      - name: Verify ELF architecture and ABI
+        shell: bash
+        run: |
+          bin="target/$TARGET/release/ai-edge-gateway"
+          LC_ALL=C readelf -hW "$bin" | grep -F "Machine:" | grep -F "$ELF_MACHINE"
+          headers=$(LC_ALL=C readelf -lW "$bin")
+          dynamic=$(LC_ALL=C readelf -dW "$bin")
+          if grep -Eq 'Shared library: \[lib(ssl|crypto)\.so' <<<"$dynamic"; then
+            echo 'Unexpected dynamic OpenSSL dependency' >&2
+            exit 1
+          fi
+          if [[ "$LIBC" == musl ]]; then
+            if grep -q 'INTERP' <<<"$headers" || grep -q '(NEEDED)' <<<"$dynamic"; then
+              echo 'musl artifact is not fully static' >&2
+              exit 1
+            fi
+          else
+            grep -Eq 'Shared library: \[libc\.so\.6\]' <<<"$dynamic"
+            versions=$(LC_ALL=C readelf --version-info --wide "$bin")
+            max_glibc=$(grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' <<<"$versions" | cut -d_ -f2 | sort -Vu | tail -n1)
+            printf 'Highest required glibc ABI: %s\n' "$max_glibc"
+            test "$(printf '%s\n' "$max_glibc" 2.35 | sort -V | tail -n1)" = 2.35
+          fi
+
+      - name: Package binary and example configuration
+        shell: bash
+        run: |
+          package="ai-edge-gateway-$TARGET"
+          root="$RUNNER_TEMP/package/$package"
+          mkdir -p "$root/licenses" dist
+          install -m 0755 "target/$TARGET/release/ai-edge-gateway" "$root/ai-edge-gateway"
+          install -m 0644 README.md config.example.toml "$root/"
+          for dep in h3 h3-quinn quinn quinn-proto; do
+            mkdir -p "$root/licenses/$dep"
+            install -m 0644 vendor/"$dep"/LICENSE* "$root/licenses/$dep/"
+          done
+          printf 'target: %s\ncommit: %s\nrust: %s\n' "$TARGET" "$GITHUB_SHA" "$RUST_VERSION" > "$root/BUILD.txt"
+          epoch=$(git show -s --format=%ct HEAD)
+          tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner \
+            -C "$RUNNER_TEMP/package" -cf - "$package" | gzip -n > "dist/$package.tar.gz"
+
+      - name: Store the archive
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: pkg-${{ matrix.target }}
+          path: dist/ai-edge-gateway-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  publish:
+    name: Attach release assets
+    if: github.event_name == 'release' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Collect successful builds
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          path: dist
+          pattern: pkg-*
+          merge-multiple: true
+
+      - name: Verify the complete asset set and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || github.ref_name }}
+        shell: bash
+        run: |
+          cd dist
+          packages=(
+            ai-edge-gateway-aarch64-unknown-linux-gnu.tar.gz
+            ai-edge-gateway-aarch64-unknown-linux-musl.tar.gz
+            ai-edge-gateway-x86_64-unknown-linux-gnu.tar.gz
+            ai-edge-gateway-x86_64-unknown-linux-musl.tar.gz
+          )
+          for asset in "${packages[@]}"; do test -s "$asset"; done
+          sha256sum "${packages[@]}" > SHA256SUMS
+          assets=("${packages[@]}" SHA256SUMS)
+
+          # A tag push can create the release without local gh authentication.
+          # Stage assets on a draft before making it public (immutable-release compatible).
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [[ "$GITHUB_EVENT_NAME" != push ]]; then
+              echo 'Published release could not be found' >&2
+              exit 1
+            fi
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --draft --generate-notes
+          fi
+
+          # Unlike the REST tag endpoint, gh release view also finds drafts.
+          release_id=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json databaseId --jq .databaseId)
+          info=$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id")
+          if [[ $(jq -r '.immutable // false' <<<"$info") == true ]]; then
+            for asset in "${assets[@]}"; do
+              jq -e --arg name "$asset" 'any(.assets[]; .name == $name)' <<<"$info" >/dev/null || {
+                echo 'This release is immutable and is missing assets. Publish the next version via a version-tag push.' >&2
+                exit 1
+              }
+            done
+            echo 'All assets already present on the immutable release.'
+            exit 0
+          fi
+
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber "${assets[@]}"
+          if [[ "$GITHUB_EVENT_NAME" == push && $(jq -r '.draft' <<<"$info") == true ]]; then
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          fi

@@ -1,0 +1,108 @@
+# 安全可运行的起点：只监听回环，明文 H1/H2 prior knowledge，客户端自带官方 Key。
+# 复制为 config.toml（chmod 0600）。真实凭据不要写入此模板、命令行或版本库。
+mode = "byok"                 # byok / managed / disabled；[routes.<provider>] 可覆盖
+byok_egress = "local_auto_v4"  # BYOK 默认出口；实际部署建议换成绑定真实本地地址的配置
+
+# Termux/Android 通常没有 /etc/resolv.conf，请填一个可达的受信任递归 DNS。
+# 以下是示例公共解析器，可改成内网 DNS + 非 53 端口；Linux 上 [] 读取系统 DNS。
+# DNS 查询走系统到解析器的路由；业务 TCP/QUIC 源地址由 EgressProfile 固定。
+dns_servers = ["1.1.1.1:53", "9.9.9.9:53"]
+
+[listen]
+bind = "127.0.0.1:8080"       # TLS 可改成 "0.0.0.0:8443" 或 "[::]:8443"（后者仅 IPv6）
+management = "127.0.0.1:9080" # 必须为 loopback；GET /healthz 与 /metrics 不经过代理路由
+h3 = false                     # 启用后同端口监听 TCP+UDP；必须同时启用 [tls]
+quic_retry = true               # QUIC 地址验证；首次连接可能多一个 RTT
+max_connections = 256           # 公网 TCP + QUIC + 升级后的 WebSocket 共享上限
+max_in_flight = 256             # 含上传、SSE、WebSocket；满载 503，不无限排队
+max_header_bytes = 32768        # H1 读缓冲 / H2/H3 解码字段大小，另有统一的请求/响应检查
+streams_per_connection = 64     # 服务器端 H2/H3 stream 上限
+header_timeout_secs = 10        # 下游 TLS/QUIC 握手和首个请求头，H1/H3 也限制后续头部
+idle_connection_timeout_secs = 90 # 下游 H2：最后一个流结束后的空闲期限；PING 不重置
+
+# 生产 HTTPS：取消本节注释，证书路径相对 config.toml；证书链 PEM，PEM 私钥。
+# [tls]
+# cert = "tls/fullchain.pem"
+# key = "tls/privkey.pem"
+# tcp_early_data = true         # TLS1.3 可接收最多 16 KiB early bytes；握手确认后才派发
+# quic_early_data = true        # QUIC 可在握手未确认时派发 GET/HEAD/OPTIONS
+
+[limits]
+connect_timeout_secs = 5       # 包括 DNS、TCP/TLS；H3 探测另受较短预算限制
+response_header_timeout_secs = 180 # 无 body 从派发计时；流式上传完成后重新开始计时
+stream_idle_timeout_secs = 60  # 上传/输出分片之间；不限制持续有进展的总时长
+shutdown_drain_timeout_secs = 30
+h3_probe_timeout_ms = 750      # 首次 QUIC 探测包括 DNS/握手/H3 初始化，失败才走 TCP
+h3_cooldown_secs = 60           # 按隔离域负缓存；冷却后下一次请求可重新探测
+upstream_0rtt = true            # 只有明确无 body 的 GET/HEAD/OPTIONS 可尝试 QUIC 0-RTT
+allow_0rtt_non_idempotent = false # 不建议打开：计费操作可能因重放被执行多次
+byok_pool_capacity = 32         # 先淘汰过期空闲域，再按 LRU 淘汰；全部在途才 503
+byok_pool_idle_secs = 90        # BYOK 空闲池 TTL；活跃长流不参与淘汰
+websocket = true                # Cargo 默认 feature `websocket`；禁编时改 false
+
+[egress.local_auto_v4]
+mode = "v4_only"
+local_v4 = "0.0.0.0"
+allow_wildcard = true           # 仅 BYOK 便捷配置；由 OS 选源 IP，不是固定出口
+
+# 以下地址仅用于文档。替换为你的网卡实际地址后才能取消注释；任何无效配置拒绝启动/重载。
+# [egress.fixed_v4]
+# mode = "v4_only"             # 仅查询 A，仅 IPv4 socket
+# local_v4 = "192.0.2.21"
+# interface = "eth0"          # 可选 Linux/Android SO_BINDTODEVICE，受内核权限限制
+# freebind = false             # 不建议启用；即使 bind 成功也不能代替路由/网卡配置
+#
+# [egress.fixed_v6]
+# mode = "v6_only"             # 仅查询 AAAA，仅 AF_INET6
+# local_v6 = "2001:db8:2::21"
+#
+# [egress.fixed_dual]
+# mode = "dual_stack"
+# local_v4 = "192.0.2.22"
+# local_v6 = "2001:db8:2::22"
+# strategy = "happy_eyeballs"  # prefer_v4 / prefer_v6 / happy_eyeballs
+# happy_eyeballs_delay_ms = 250
+
+[routes.openai]
+# host = "openai.gateway.example.com"  # 可选；Host 路由不剥前缀
+# mode = "managed"                      # 如启用，请配置下文 upstreams 和 users.grants
+# byok_egress = "fixed_v4"
+prefer_h3 = false                      # 插件式优先；官方可能不提供 H3，预探测失败回退
+
+[routes.claude]
+# host = "claude.gateway.example.com"
+prefer_h3 = false
+
+[routes.gemini]
+# host = "gemini.gateway.example.com"
+prefer_h3 = false
+
+# Managed 示例：在相应 routes 表中加 mode = "managed"，并启用真实固定出口。
+# 每项必须 key_env / key 二选一；推荐通过服务管理器加载环境变量。
+# [upstreams.team_openai]
+# provider = "openai"
+# egress = "fixed_v4"
+# key_env = "OFFICIAL_OPENAI_KEY"
+# prefer_h3 = false            # 可选；覆盖 routes.<provider>.prefer_h3
+#
+# [upstreams.team_claude]
+# provider = "claude"
+# egress = "fixed_v6"
+# key_env = "OFFICIAL_ANTHROPIC_KEY"
+#
+# [upstreams.team_gemini]
+# provider = "gemini"
+# egress = "fixed_dual"
+# key_env = "OFFICIAL_GEMINI_KEY"
+#
+# [users.team_a]
+# key_env = "GATEWAY_TEAM_A_KEY" # >=24 字符，使用高熵随机值；不同 users 的 Key 不可重复
+# [users.team_a.grants]
+# openai = { upstream = "team_openai", path_prefixes = ["/v1/models", "/v1/responses"], methods = ["GET", "POST"] }
+# claude = { upstream = "team_claude", path_prefixes = ["/v1/messages"], methods = ["POST"] }
+# gemini = { upstream = "team_gemini", path_prefixes = ["/v1beta/models/"], methods = ["GET", "POST"] }
+#
+# [users.team_b]
+# key_env = "GATEWAY_TEAM_B_KEY"
+# [users.team_b.grants]
+# openai = { upstream = "team_openai", path_prefixes = ["/v1/models"], methods = ["GET"] }
