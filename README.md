@@ -2,35 +2,44 @@
 
 面向 OpenAI、Anthropic 和 Gemini 官方 API 的 Rust 流式反向代理。下游支持 HTTP/1.1、HTTP/2 和 HTTP/3；上游默认用 TLS ALPN 首选 H2，兼容 H1，按路由/账号选择是否优先 H3。没有任意 URL 转发、数据库、请求重放队列、压缩中间件或 OpenSSL 运行时依赖。
 
-## 快速开始（Termux / Linux）
+## 快速开始
 
-最低 Rust 版本以 `Cargo.toml` 为准。Termux 示例：
+### Linux / Alpine：一行下载并启动
+
+适用 **x86_64 / ARM64 Linux**。需要 `curl`、`tar`、`awk` 和 `sha256sum`，不需要 Rust、sudo 或 Docker。复制整行运行：
 
 ```sh
-pkg install rust clang cmake make pkg-config
-cd ~/ai-edge-gateway
-umask 077
-cp config.example.toml config.toml
-cargo build --locked --release
-./target/release/ai-edge-gateway --config config.toml --check
-./target/release/ai-edge-gateway --config config.toml
+s=$(curl -fsS -H 'Accept: application/vnd.github.raw+json' 'https://api.github.com/repos/jinmanji/ai-edge-gateway/contents/scripts/quick-start.sh?ref=main') && sh -c "$s"
 ```
 
-首次构建 AWS-LC 和 fat LTO 会比增量构建慢；内存紧张的设备可加 `-j 1`。Linux 上使用现有 Rust/C 工具链及 CMake。管理端口默认仅对回环开放：
+[启动脚本](scripts/quick-start.sh)自动选择对应架构的全静态 [v0.1.0](https://github.com/jinmanji/ai-edge-gateway/releases/tag/v0.1.0) 产物，校验 `SHA256SUMS` 后安装到 `${XDG_DATA_HOME:-$HOME/.local/share}/ai-edge-gateway`（可用环境变量 `AIEG_HOME` 改位置）。首次启动生成 `config.toml`，以后不会覆盖；启动前先校验配置。默认以前台方式运行，按 `Ctrl+C` 停止。
+
+### 原生 Termux：一行构建并启动
+
+首次使用先安装工具链：`pkg install git rust clang cmake make pkg-config curl`。如项目尚未克隆，下面的命令会先克隆，再构建并启动；已有 `config.toml` 不会被覆盖：
+
+```sh
+(cd "$HOME" && { [ -d ai-edge-gateway ] || git clone https://github.com/jinmanji/ai-edge-gateway.git; } && cd ai-edge-gateway && cargo build --locked --release && { [ -e config.toml ] || (umask 077; set -C; cat config.example.toml > config.toml); } && ./target/release/ai-edge-gateway --config config.toml --check && exec ./target/release/ai-edge-gateway --config config.toml)
+```
+
+首次构建 AWS-LC 和 fat LTO 较慢；内存紧张时可在 `cargo build` 后加 `-j 1`。Termux 使用本机编译的 Android 二进制，不使用 Linux Release 安装包。
+
+### 验证并发送第一个请求
+
+另开一个终端检查就绪状态，**不需要 API Key**：
 
 ```sh
 curl -fsS http://127.0.0.1:9080/healthz
-curl -fsS http://127.0.0.1:9080/metrics
 ```
 
-代理端口默认 `127.0.0.1:8080`。以 BYOK 为例，先通过安全渠道提供 `OPENAI_API_KEY`，不要开启 shell 或 curl 的详细请求跟踪：
+默认代理监听 `127.0.0.1:8080`，管理端口 `127.0.0.1:9080` 另提供 `/metrics`。默认是 BYOK。以 OpenAI 为例，先通过安全渠道提供 `OPENAI_API_KEY`，再请求模型列表（不要开启 shell 或 curl 的详细请求跟踪）：
 
 ```sh
 printf 'header = "Authorization: Bearer %s"\n' "$OPENAI_API_KEY" |
   curl --config - -fsS http://127.0.0.1:8080/openai/v1/models
 ```
 
-客户端可将 SDK 的 Base URL 分别设为 `http://127.0.0.1:8080/openai/v1`、`http://127.0.0.1:8080/claude` 或 `http://127.0.0.1:8080/gemini`，具体是否追加版本路径取决于 SDK。与远程终端通信应启用证书和 HTTPS；不要对不可信网络暴露明文监听器。反代后端明文 H2 用 prior knowledge（如 `curl --http2-prior-knowledge`），不实现旧式 `Upgrade: h2c`。启用 `[tls]` 和 `listen.h3 = true` 后，开放同一端口的 **TCP 和 UDP**；用支持 QUIC 的客户端验证 `curl --http3-only https://HOST:PORT/...`。如果入口有端口映射，`Alt-Svc` 使用本进程实际监听端口，需要让外部端口一致或由前置代理重写。
+SDK 的 Base URL 可设为 `http://127.0.0.1:8080/openai/v1`、`http://127.0.0.1:8080/claude` 或 `http://127.0.0.1:8080/gemini`，按 SDK 是否自行添加版本路径调整。不要在不可信网络上暴露明文端口。明文 H2 使用 prior knowledge（如 `curl --http2-prior-knowledge`）；启用 `[tls]` 和 `listen.h3 = true` 时，需开放同一端口的 **TCP 和 UDP**。如果做了端口映射，还需确保外部 `Alt-Svc` 中的端口正确。
 
 ### 编译选项
 
@@ -64,7 +73,7 @@ musl 两包为全静态 ELF，不需要额外安装 glibc 兼容层或 OpenSSL�
 
 ```sh
 package=ai-edge-gateway-x86_64-unknown-linux-musl
-grep "  ${package}.tar.gz$" SHA256SUMS | sha256sum -c -
+awk -v f="${package}.tar.gz" '$2 == f { print }' SHA256SUMS | sha256sum -c -
 tar -xzf "${package}.tar.gz"
 cd "$package"
 ./ai-edge-gateway --config config.example.toml --check
