@@ -75,7 +75,18 @@ prefer_h3 = false
 
 [routes.gemini]
 # host = "gemini.gateway.example.com"
+# byok_egress = "fixed_v6" # 使用下面的 IPv6 列表时需选择 v6_only / dual_stack 出口
 prefer_h3 = false
+
+# 可选：只改目标 IP，不改官方 Host、TLS SNI 和证书验证。各 provider 都可以设置。
+# [routes.gemini.resolve]
+# ipv4 = ["192.0.2.10"]    # 静态 A 覆盖（文档地址，替换后再启用）
+# ipv6 = ["2001:db8::10"]  # 静态 AAAA 覆盖（文档地址，替换后再启用）
+# ipv6_list_file = "gemini-ipv6.txt" # 相对配置文件，一行一个公网 IPv6，重载 SIGHUP 后生效
+# ipv6_list_url = "https://raw.githubusercontent.com/ccbkkb/ipv6-googleapis/refs/heads/main/valid_ips.txt"
+# ipv6_refresh_secs = 86400 # 后台刷新；失败保留上次有效列表，60 秒后重试
+# 未配置的地址族继续走 DNS；配置了 IPv6 列表则不查询 Gemini AAAA。
+# 静态 IPv6 / 文件可用作首次远端刷新前的种子；远端成功后优先使用远端列表。
 
 # Managed 示例：在相应 routes 表中加 mode = "managed"，并启用真实固定出口。
 # 每项必须 key_env / key 二选一；推荐通过服务管理器加载环境变量。

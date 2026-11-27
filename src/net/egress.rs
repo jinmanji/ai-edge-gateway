@@ -15,7 +15,8 @@ use tokio::{
     time::{Instant, sleep_until, timeout},
 };
 
-use crate::{ConfigError, Result, net::dns::Dns};
+use super::{dns::Dns, resolve::Overrides};
+use crate::{ConfigError, Result};
 
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -244,10 +245,11 @@ impl Egress {
 
     /// Race the whole transport establishment, including TLS. Scoped futures
     /// cancel losing dials and don't keep sockets alive after a dropped request.
-    pub async fn race<T, F, Fut>(
+    pub(crate) async fn race<T, F, Fut>(
         &self,
         fqdn: &str,
         port: u16,
+        overrides: Option<&Overrides>,
         budget: Duration,
         connect: F,
     ) -> io::Result<T>
@@ -255,17 +257,32 @@ impl Egress {
         F: Fn(SocketAddr) -> Fut,
         Fut: Future<Output = io::Result<T>>,
     {
-        timeout(budget, self.race_inner(fqdn, port, connect))
+        timeout(budget, self.race_inner(fqdn, port, overrides, connect))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "upstream connection deadline"))?
     }
 
-    async fn race_inner<T, F, Fut>(&self, fqdn: &str, port: u16, connect: F) -> io::Result<T>
+    async fn race_inner<T, F, Fut>(
+        &self,
+        fqdn: &str,
+        port: u16,
+        overrides: Option<&Overrides>,
+        connect: F,
+    ) -> io::Result<T>
     where
         F: Fn(SocketAddr) -> Fut,
         Fut: Future<Output = io::Result<T>>,
     {
         let mut lookup = [self.local(false).is_some(), self.local(true).is_some()];
+        let mut queues = [VecDeque::new(), VecDeque::new()];
+        if let Some(overrides) = overrides {
+            for (i, should_lookup) in lookup.iter_mut().enumerate() {
+                if *should_lookup && let Some(ips) = overrides.candidates(port, i == 1) {
+                    queues[i] = ips;
+                    *should_lookup = false;
+                }
+            }
+        }
         let dns_v4 = self.dns.addresses(fqdn, port, false);
         let dns_v6 = self.dns.addresses(fqdn, port, true);
         tokio::pin!(dns_v4, dns_v6);
@@ -280,10 +297,9 @@ impl Egress {
         } else {
             delay
         };
-        let mut queues = [VecDeque::new(), VecDeque::new()];
         let mut attempts = FuturesUnordered::new();
         let mut last = None;
-        let mut last_error = io::Error::other("no DNS address in permitted families");
+        let mut last_error = io::Error::other("no destination address in permitted families");
         let mut next_dial = Instant::now();
         let mut alternate_at = None;
         loop {
@@ -358,6 +374,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ipv6_override_bypasses_aaaa_without_disabling_other_family_dns() {
+        let Ok(listener) = TcpListener::bind("[::1]:0").await else {
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        let nameserver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dns = Arc::new(Dns::new(&[nameserver.local_addr().unwrap()]).unwrap());
+        let book = Overrides::build(
+            toml::from_str("ipv6 = ['::1']").unwrap(),
+            std::path::Path::new("."),
+            None,
+            dns.clone(),
+            crate::net::tls::provider(),
+            Arc::new(rustls::RootCertStore::empty()),
+        )
+        .unwrap();
+        let egress = Egress::new("ipv6-override", spec(IpMode::V6Only), dns, false).unwrap();
+        let stream = egress
+            .race(
+                "no-aaaa.example.",
+                port,
+                Some(&book),
+                Duration::from_secs(1),
+                |addr| egress.tcp(addr),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), listener.local_addr().unwrap());
+        assert!(stream.local_addr().unwrap().is_ipv6());
+        assert!(book.candidates(port, false).is_none());
+        let err = nameserver.try_recv_from(&mut [0; 512]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[tokio::test]
     async fn exact_dns_families_and_happy_eyeballs_fallback() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let port = socket.local_addr().unwrap();
@@ -410,6 +461,7 @@ mod tests {
                 .race(
                     "local.gateway.test.",
                     tcp_port,
+                    None,
                     Duration::from_secs(2),
                     |addr| profile.tcp(addr),
                 )
@@ -434,6 +486,7 @@ mod tests {
             .race(
                 "local.gateway.test.",
                 443,
+                None,
                 Duration::from_secs(2),
                 |addr| async move {
                     if addr.is_ipv6() {

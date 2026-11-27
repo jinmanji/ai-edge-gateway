@@ -114,7 +114,9 @@ async fn serve(args: Args) -> Result<()> {
                 pending = None;
                 match result {
                     Ok(Ok(new)) => {
-                        app.config.store(Arc::new(new));
+                        let new = Arc::new(new);
+                        app.config.store(new.clone());
+                        new.schedule_endpoint_refresh(&app.tasks, &app.stop);
                         tracing::info!("configuration reloaded");
                     }
                     Ok(Err(e)) => tracing::warn!(reason = %e, "configuration rejected; keeping previous snapshot"),
@@ -126,7 +128,11 @@ async fn serve(args: Args) -> Result<()> {
                 let old = app.config.load_full();
                 pending = Some(tokio::task::spawn_blocking(move || Snapshot::from_file(&path, Some(&old))));
             }
-            _ = reap.tick() => { app.config.load_full().maintain().await; }
+            _ = reap.tick() => {
+                let snapshot = app.config.load_full();
+                snapshot.schedule_endpoint_refresh(&app.tasks, &app.stop);
+                snapshot.maintain().await;
+            }
         }
     }
     let drained = server::shutdown(&app).await;

@@ -23,7 +23,7 @@ use crate::{
     ConfigError, Result,
     config::{Limits, Provider, secret::Fingerprint},
     metrics::Stats,
-    net::{egress::Egress, tls},
+    net::{egress::Egress, resolve::Overrides, tls},
     proxy::body::{Fault, ProxyBody},
 };
 
@@ -32,6 +32,7 @@ pub struct Origin {
     pub authority: Authority,
     pub host: HeaderValue,
     dns: Arc<str>,
+    pub(crate) resolve: Option<Arc<Overrides>>,
     port: u16,
     server_name: ServerName<'static>,
 }
@@ -42,6 +43,7 @@ impl Origin {
             authority: Authority::from_static(p.host()),
             host: HeaderValue::from_static(p.host()),
             dns: p.dns_name().into(),
+            resolve: None,
             port: 443,
             server_name: ServerName::try_from(p.host())
                 .expect("valid static official TLS name")
@@ -56,11 +58,17 @@ impl Origin {
         Uri::from_parts(parts)
     }
     #[cfg(test)]
+    pub(crate) fn with_mock_port(mut self, port: u16) -> Self {
+        self.port = port;
+        self
+    }
+    #[cfg(test)]
     pub fn mock(addr: std::net::SocketAddr) -> Self {
         Self {
             authority: addr.to_string().parse().unwrap(),
             host: HeaderValue::from_str(&addr.to_string()).unwrap(),
             dns: addr.ip().to_string().into(),
+            resolve: None,
             port: addr.port(),
             server_name: ServerName::try_from("localhost").unwrap().to_owned(),
         }

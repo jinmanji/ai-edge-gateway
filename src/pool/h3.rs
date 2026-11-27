@@ -158,6 +158,7 @@ impl Pool {
             .race(
                 &self.origin.dns,
                 self.origin.port,
+                self.origin.resolve.as_deref(),
                 deadline.saturating_duration_since(tokio::time::Instant::now()),
                 |addr| async move {
                     let family = usize::from(addr.is_ipv6());

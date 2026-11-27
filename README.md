@@ -109,9 +109,34 @@ cd "$package"
 
 Host、连接指定的 hop-by-hop 字段、转发地址头和上游 `Alt-Svc` 不会被信任。网关不打印请求地址、Query、认证头或库的 HTTP debug。`zeroize` 覆盖自管密钥和部分临时缓冲，但不是整进程擦除承诺，协议栈、环境变量、TLS/HTTP 序列化以及 URI 的内存无法都保证擦除。上线请禁用 core dump，保护配置、私钥和进程 UID，审计前置代理日志。运行时不主动采集响应内容；上游和客户端仍可能记录其自身处理的请求。
 
+## 自定义端点 IP（Gemini AAAA 异常）
+
+`[routes.<provider>.resolve]` 只覆盖建立连接使用的**目标 IP**。OpenAI、Claude、Gemini 都可以配置；BYOK、Managed 共用该厂商设置。即使目标改为 IP，请求的 Host/`:authority`、TLS SNI 和证书校验仍使用**官方域名**，不会关闭 TLS 验证，也不会将端口改成非 443。
+
+例如使用 [ipv6-googleapis 的 Gemini IPv6 列表](https://github.com/ccbkkb/ipv6-googleapis)，合并进现有 `config.toml` 的相应表（同名 TOML 表只能定义一次）：
+
+```toml
+[egress.gemini_v6]
+mode = "v6_only"
+local_v6 = "::"
+allow_wildcard = true   # 仅 BYOK 便捷配置：由 OS 选源；需要固定 IP 时填写真实本地 IPv6 并删掉本行
+
+[routes.gemini]
+byok_egress = "gemini_v6"
+
+[routes.gemini.resolve]
+ipv6_list_url = "https://raw.githubusercontent.com/ccbkkb/ipv6-googleapis/refs/heads/main/valid_ips.txt"
+ipv6_refresh_secs = 86400
+```
+
+- **先确认出口支持 IPv6。** `v4_only` 不会尝试 IPv6 列表；`dual_stack` 仍可使用 IPv4（正常 A 记录或自定义 `ipv4`）。Managed 应把对应 `[upstreams.xxx].egress` 指向一个绑定真实 IPv6 的固定出口，不能使用 `::` 通配源。此功能不提供 IPv6 连接或路由。
+- **地址优先级。** 未配置的地址族继续查 DNS。配置 IPv6 列表就跳过该厂商的 AAAA；已成功下载的列表优先于 `ipv6` 静态数组或本地文件。新连接轮换、竞速尝试各家族最多 16 个候选；已有连接和在途流不会因列表刷新被切断。在 `v6_only` 下，如首次下载尚未成功且无种子地址，IPv6 请求会暂时返回上游连接错误。
+- **自动刷新。** 配置启用后在启动或 SIGHUP 后异步下载，默认每 24 小时更新一次；下载或校验失败，保留内存中上次有效的列表并约每分钟重试。列表来源是独立 HTTPS 请求，不带任何 API Key；只接受一行一个公网 IPv6（可有空行和 `#` 注释），不跟随重定向。下载通过 `dns_servers` 解析列表域名、使用系统路由，不受 Gemini 的出口配置或地址覆盖影响。
+- **离线/静态方式。** `[routes.gemini.resolve]` 支持 `ipv4 = ["..."]`、`ipv6 = ["..."]` 和 `ipv6_list_file = "gemini-ipv6.txt"`。需要跨进程重启保留一份列表，或部署环境不能访问 GitHub 时，可从可信渠道预下载 `valid_ips.txt`，将其放到 `config.toml` 同目录，作为初始种子或仅使用文件模式。更新本地文件后用 SIGHUP 重载。`--check` 校验配置与文件但不发网络请求。
+
 ## 多出口 IP（Linux）
 
-出口配置不会凭空分配地址，也不会绕过路由。`v4_only` 仅查询 A，`v6_only` 仅查询 AAAA；双栈并发解析，根据优先策略交错尝试，默认优先 IPv6，IPv4 地址先返回时最多等 50ms；按 250ms 间隔发起备选连接，硬失败则更早尝试下一地址。TCP/TLS 和 QUIC 都按目标族选择绑定的源地址；DNS 解析器的**网络传输**走独立系统 DNS 路由（只查 A 不等于要求 DNS 服务器必须是 IPv4）。DNS 命中使用 Hickory 的 TTL 缓存。
+出口配置不会凭空分配地址，也不会绕过路由。未配置端点 IP 覆盖时，`v4_only` 仅查询 A，`v6_only` 仅查询 AAAA；双栈并发解析，根据优先策略交错尝试，默认优先 IPv6，IPv4 地址先返回时最多等 50ms；按 250ms 间隔发起备选连接，硬失败则更早尝试下一地址。TCP/TLS 和 QUIC 都按目标族选择绑定的源地址；DNS 解析器的**网络传输**走独立系统 DNS 路由（只查 A 不等于要求 DNS 服务器必须是 IPv4）。DNS 命中使用 Hickory 的 TTL 缓存。
 
 以下为文档地址，部署前替换地址、网关和网卡名。公网 IP/NAT 规则需要由云厂商或网络管理员配置；先用 `ip route get ... from ...` 验证策略路由：
 

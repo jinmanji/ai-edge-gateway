@@ -91,6 +91,7 @@ impl Service<Uri> for Connector {
                 .race(
                     &connector.origin.dns,
                     connector.origin.port,
+                    connector.origin.resolve.as_deref(),
                     connector.timeout,
                     |addr| async move {
                         let tcp = shared.egress.tcp(addr).await?;

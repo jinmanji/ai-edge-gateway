@@ -19,6 +19,7 @@ use crate::{
     net::{
         dns::Dns,
         egress::{Egress, EgressSpec},
+        resolve::{Overrides, ResolveSpec},
         tls::{self, DownstreamTls},
     },
     pool::{ByokPools, Origin, Pool, PoolFactory},
@@ -155,6 +156,7 @@ struct RouteSpec {
     host: Option<String>,
     byok_egress: Option<String>,
     prefer_h3: bool,
+    resolve: Option<ResolveSpec>,
 }
 
 #[derive(Deserialize)]
@@ -328,7 +330,7 @@ impl Snapshot {
         previous: Option<&Self>,
         crypto: Arc<rustls::crypto::CryptoProvider>,
         roots: Arc<rustls::RootCertStore>,
-        origins: [Origin; 3],
+        mut origins: [Origin; 3],
     ) -> Result<Self> {
         validate(&disk)?;
         if let Some(old) = previous
@@ -390,6 +392,20 @@ impl Snapshot {
                 .transpose()?;
             if mode == Mode::Byok && byok_egress.is_none() {
                 return Err("each BYOK route needs a default or per-route egress".into());
+            }
+            if let Some(resolve) = spec.resolve {
+                let slot = provider.index();
+                let old = previous.and_then(|s| s.factory.origins[slot].resolve.as_deref());
+                let overrides = Overrides::build(
+                    resolve,
+                    base,
+                    old,
+                    resolver.clone(),
+                    crypto.clone(),
+                    roots.clone(),
+                )
+                .map_err(|e| ConfigError(format!("routes.{}.resolve: {e}", provider.name())))?;
+                origins[slot].resolve = Some(Arc::new(overrides));
             }
             routes.push(Route {
                 mode,
@@ -510,6 +526,21 @@ impl Snapshot {
             managed: domains.into_values().collect(),
             metrics,
         })
+    }
+
+    pub fn schedule_endpoint_refresh(
+        &self,
+        tasks: &tokio_util::task::TaskTracker,
+        stop: &tokio_util::sync::CancellationToken,
+    ) {
+        for provider in Provider::ALL {
+            let slot = provider.index();
+            if self.routes[slot].mode != Mode::Disabled
+                && let Some(resolve) = &self.factory.origins[slot].resolve
+            {
+                resolve.schedule(provider.name(), tasks, stop);
+            }
+        }
     }
 
     pub async fn maintain(&self) {

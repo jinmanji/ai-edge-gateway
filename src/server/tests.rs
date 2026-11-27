@@ -131,10 +131,14 @@ struct Seen {
     id: usize,
     peer: SocketAddr,
     early_transport: bool,
+    tls_name: Option<String>,
 }
 
 #[derive(Clone)]
 struct EarlyTransport;
+
+#[derive(Clone)]
+struct TlsName(String);
 
 struct Mock {
     heads: mpsc::UnboundedSender<Seen>,
@@ -173,8 +177,11 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_sans(vec!["localhost".to_owned()])
+    }
+    fn with_sans(names: Vec<String>) -> Self {
         let dir = Temp::new();
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let cert = rcgen::generate_simple_self_signed(names).unwrap();
         fs::write(dir.0.join("cert.pem"), cert.cert.pem()).unwrap();
         fs::write(dir.0.join("key.pem"), cert.signing_key.serialize_pem()).unwrap();
         let mut roots = RootCertStore::empty();
@@ -212,6 +219,24 @@ impl Fixture {
         routes: &str,
         listen: &str,
     ) -> Running {
+        self.run_origins(
+            Provider::ALL.map(|_| Origin::mock(upstream)),
+            secure,
+            h3,
+            limits,
+            routes,
+            listen,
+        )
+    }
+    fn run_origins(
+        &self,
+        origins: [Origin; 3],
+        secure: bool,
+        h3: bool,
+        limits: &str,
+        routes: &str,
+        listen: &str,
+    ) -> Running {
         let text = format!(
             r#"
 dns_servers = ["127.0.0.1:53"]
@@ -236,15 +261,8 @@ shutdown_drain_timeout_secs = 3
         } else {
             text
         };
-        let snapshot = Arc::new(
-            Snapshot::for_test(
-                &text,
-                self.path(),
-                Provider::ALL.map(|_| Origin::mock(upstream)),
-                self.roots.clone(),
-            )
-            .unwrap(),
-        );
+        let snapshot =
+            Arc::new(Snapshot::for_test(&text, self.path(), origins, self.roots.clone()).unwrap());
         // TCP and UDP have separate ephemeral port allocators. A TCP port picked
         // by the kernel occasionally happens to be in use on UDP already.
         for _ in 0..8 {
@@ -302,7 +320,11 @@ shutdown_drain_timeout_secs = 3
                         children.spawn(async move {
                             let Ok(tls) = acceptor.accept(tcp).await else { return; };
                             let id = mock.id.fetch_add(1, Relaxed);
-                            let svc = service_fn(move |r: Request<Incoming>| handle_mock(r.map(|b| b.map_err(|_| Fault::Downstream).boxed_unsync()), peer, id, mock.clone()));
+                            let name = tls.get_ref().1.server_name().map(|name| TlsName(name.to_owned()));
+                            let svc = service_fn(move |mut r: Request<Incoming>| {
+                                if let Some(name) = &name { r.extensions_mut().insert(name.clone()); }
+                                handle_mock(r.map(|b| b.map_err(|_| Fault::Downstream).boxed_unsync()), peer, id, mock.clone())
+                            });
                             if h2 {
                                 let _ = http2::Builder::new(TokioExecutor::new()).serve_connection(TokioIo::new(tls), svc).await;
                             } else {
@@ -446,6 +468,10 @@ async fn handle_mock(
         id,
         peer,
         early_transport: req.extensions().get::<EarlyTransport>().is_some(),
+        tls_name: req
+            .extensions()
+            .get::<TlsName>()
+            .map(|value| value.0.clone()),
     });
     if path.ends_with("/wait") {
         let _watch = NotifyDrop(mock.cancelled.clone());
@@ -1465,4 +1491,73 @@ async fn idle_h2_releases_connection_lease_but_active_sse_does_not_idle() {
     )
     .await;
     assert!(shutdown(&running.app).await);
+}
+
+#[tokio::test]
+async fn custom_ip_dials_override_on_tcp_and_quic_without_changing_gemini_tls_identity() {
+    let official = Provider::Gemini.host();
+    let f = Fixture::with_sans(vec![official.to_owned()]);
+    // No configured DNS server will answer the Gemini name in this fixture.
+    // The mock certificate is trusted only for Gemini, never for the literal IP.
+    for h3 in [false, true] {
+        let mut mock = if h3 {
+            f.mock_quic()
+        } else {
+            f.mock_tcp(false).await
+        };
+        let origins = Provider::ALL.map(|p| Origin::official(p).with_mock_port(mock.addr.port()));
+        let routes = format!(
+            "[routes.gemini]\nprefer_h3={h3}\n[routes.gemini.resolve]\nipv4=['127.0.0.1']\n"
+        );
+        let running = f.run_origins(
+            origins,
+            false,
+            false,
+            "h3_probe_timeout_ms=1000",
+            &routes,
+            "",
+        );
+        let (mut send, _driver) = client1(running.public_addr).await;
+        let req = Request::builder()
+            .uri("/gemini/v1beta/models?alt=json")
+            .header(header::HOST, "localhost")
+            .header("x-goog-api-key", "mock-byok")
+            .body(body::empty())
+            .unwrap();
+        let response = timeout(Duration::from_secs(3), send.send_request(req))
+            .await
+            .unwrap()
+            .unwrap();
+        body_eq(response, StatusCode::OK).await;
+        let seen = mock.seen().await;
+        assert_eq!(seen.path_query, "/v1beta/models?alt=json");
+        assert_eq!(seen.headers["x-goog-api-key"], "mock-byok");
+        assert_eq!(
+            seen.version,
+            if h3 {
+                Version::HTTP_3
+            } else {
+                Version::HTTP_11
+            }
+        );
+        if h3 {
+            let hello = mock
+                .mock
+                .quic_peer
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .handshake_data()
+                .unwrap();
+            let hello = hello
+                .downcast::<quinn::crypto::rustls::HandshakeData>()
+                .unwrap();
+            assert_eq!(hello.server_name.as_deref(), Some(official));
+        } else {
+            assert_eq!(seen.headers[header::HOST], official);
+            assert_eq!(seen.tls_name.as_deref(), Some(official));
+        }
+        assert!(shutdown(&running.app).await);
+    }
 }
