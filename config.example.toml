@@ -63,6 +63,14 @@ allow_wildcard = true           # 仅 BYOK 便捷配置；由 OS 选源 IP，不
 # strategy = "happy_eyeballs"  # prefer_v4 / prefer_v6 / happy_eyeballs
 # happy_eyeballs_delay_ms = 250
 
+# 可选 BYOK 出口：本机的 HTTP CONNECT 代理替网关连接目标 IPv6。
+# 不使用 HTTPS_PROXY 环境变量；该出口关闭上游 QUIC，不回退直连。
+# [egress.gemini_v6_proxy]
+# mode = "v6_only"
+# local_v6 = "::"
+# allow_wildcard = true
+# http_proxy = "http://127.0.0.1:2080"
+
 [routes.openai]
 # host = "openai.gateway.example.com"  # 可选；Host 路由不剥前缀
 # mode = "managed"                      # 如启用，请配置下文 upstreams 和 users.grants
@@ -75,7 +83,7 @@ prefer_h3 = false
 
 [routes.gemini]
 # host = "gemini.gateway.example.com"
-# byok_egress = "fixed_v6" # 使用下面的 IPv6 列表时需选择 v6_only / dual_stack 出口
+# byok_egress = "gemini_v6_proxy" # 或绑定 IPv6 的 fixed_v6 / fixed_dual
 prefer_h3 = false
 
 # 可选：只改目标 IP，不改官方 Host、TLS SNI 和证书验证。各 provider 都可以设置。

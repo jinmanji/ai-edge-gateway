@@ -12,7 +12,7 @@ use std::{
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use http::{
-    HeaderValue, Request, Response, Uri, Version,
+    Request, Response, Uri, Version,
     uri::{Authority, PathAndQuery, Scheme},
 };
 use http_body_util::BodyExt;
@@ -30,7 +30,6 @@ use crate::{
 #[derive(Clone)]
 pub struct Origin {
     pub authority: Authority,
-    pub host: HeaderValue,
     dns: Arc<str>,
     pub(crate) resolve: Option<Arc<Overrides>>,
     port: u16,
@@ -41,7 +40,6 @@ impl Origin {
     pub fn official(p: Provider) -> Self {
         Self {
             authority: Authority::from_static(p.host()),
-            host: HeaderValue::from_static(p.host()),
             dns: p.dns_name().into(),
             resolve: None,
             port: 443,
@@ -66,7 +64,6 @@ impl Origin {
     pub fn mock(addr: std::net::SocketAddr) -> Self {
         Self {
             authority: addr.to_string().parse().unwrap(),
-            host: HeaderValue::from_str(&addr.to_string()).unwrap(),
             dns: addr.ip().to_string().into(),
             resolve: None,
             port: addr.port(),
@@ -126,7 +123,9 @@ impl PoolFactory {
         } else {
             None
         };
-        let quic = if h3 {
+        // A plain HTTP CONNECT proxy carries TCP only. Never bypass the
+        // configured proxy with a direct UDP/QUIC dial.
+        let quic = if h3 && !egress.has_http_proxy() {
             let endpoints = egress.endpoints().map_err(|e| {
                 ConfigError(format!(
                     "egress {}: cannot create isolated QUIC sockets: {e}",

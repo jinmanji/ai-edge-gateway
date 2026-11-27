@@ -16,7 +16,7 @@ case "$arch" in
     *) fail "No prebuilt Linux release for $arch." ;;
 esac
 
-version=v0.1.0
+version=v0.2.0
 package=ai-edge-gateway-$arch-unknown-linux-musl
 asset=$package.tar.gz
 base=https://github.com/jinmanji/ai-edge-gateway/releases/download/$version

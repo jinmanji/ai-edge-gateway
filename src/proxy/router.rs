@@ -221,7 +221,9 @@ pub async fn route(
             }
         }
     }
-    headers.insert(header::HOST, pool.origin().host.clone());
+    // Preserve only the official URI authority. The H1 transport will add
+    // Host; HTTP/2 uses :authority without a duplicate Host field.
+    headers.remove(header::HOST);
     let target = pool
         .origin()
         .uri(target)

@@ -132,6 +132,7 @@ struct Seen {
     peer: SocketAddr,
     early_transport: bool,
     tls_name: Option<String>,
+    authority: Option<String>,
 }
 
 #[derive(Clone)]
@@ -472,6 +473,7 @@ async fn handle_mock(
             .extensions()
             .get::<TlsName>()
             .map(|value| value.0.clone()),
+        authority: req.uri().authority().map(|value| value.as_str().to_owned()),
     });
     if path.ends_with("/wait") {
         let _watch = NotifyDrop(mock.cancelled.clone());
@@ -1499,11 +1501,12 @@ async fn custom_ip_dials_override_on_tcp_and_quic_without_changing_gemini_tls_id
     let f = Fixture::with_sans(vec![official.to_owned()]);
     // No configured DNS server will answer the Gemini name in this fixture.
     // The mock certificate is trusted only for Gemini, never for the literal IP.
-    for h3 in [false, true] {
+    for version in [Version::HTTP_11, Version::HTTP_2, Version::HTTP_3] {
+        let h3 = version == Version::HTTP_3;
         let mut mock = if h3 {
             f.mock_quic()
         } else {
-            f.mock_tcp(false).await
+            f.mock_tcp(version == Version::HTTP_2).await
         };
         let origins = Provider::ALL.map(|p| Origin::official(p).with_mock_port(mock.addr.port()));
         let routes = format!(
@@ -1532,14 +1535,11 @@ async fn custom_ip_dials_override_on_tcp_and_quic_without_changing_gemini_tls_id
         let seen = mock.seen().await;
         assert_eq!(seen.path_query, "/v1beta/models?alt=json");
         assert_eq!(seen.headers["x-goog-api-key"], "mock-byok");
-        assert_eq!(
-            seen.version,
-            if h3 {
-                Version::HTTP_3
-            } else {
-                Version::HTTP_11
-            }
-        );
+        assert_eq!(seen.version, version);
+        if version != Version::HTTP_11 {
+            assert_eq!(seen.authority.as_deref(), Some(official));
+            assert!(!seen.headers.contains_key(header::HOST));
+        }
         if h3 {
             let hello = mock
                 .mock
@@ -1555,9 +1555,85 @@ async fn custom_ip_dials_override_on_tcp_and_quic_without_changing_gemini_tls_id
                 .unwrap();
             assert_eq!(hello.server_name.as_deref(), Some(official));
         } else {
-            assert_eq!(seen.headers[header::HOST], official);
+            if version == Version::HTTP_11 {
+                assert_eq!(seen.headers[header::HOST], official);
+            }
             assert_eq!(seen.tls_name.as_deref(), Some(official));
         }
         assert!(shutdown(&running.app).await);
     }
+}
+
+#[tokio::test]
+async fn gemini_connect_uses_exact_ipv6_sni_and_does_not_attempt_quic() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, copy_bidirectional};
+
+    let official = Provider::Gemini.host();
+    let fixture = Fixture::with_sans(vec![official.to_owned()]);
+    let mut upstream = fixture.mock_tcp(false).await;
+    let destination = upstream.addr;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = listener.local_addr().unwrap();
+    let task = Task(tokio::spawn(async move {
+        let (mut downstream, _) = listener.accept().await.unwrap();
+        let expected = format!(
+            "CONNECT [::1]:{} HTTP/1.1\r\nHost: [::1]:{}\r\n\r\n",
+            destination.port(),
+            destination.port()
+        );
+        let mut buf = vec![0; expected.len()];
+        downstream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, expected.as_bytes());
+        let mut upstream = TcpStream::connect(destination).await.unwrap();
+        downstream
+            .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            .await
+            .unwrap();
+        let _ = copy_bidirectional(&mut downstream, &mut upstream).await;
+    }));
+    let routes = format!(
+        r#"
+[egress.tunnel]
+mode = "v6_only"
+local_v6 = "::"
+allow_wildcard = true
+http_proxy = "http://{proxy}"
+[routes.gemini]
+byok_egress = "tunnel"
+prefer_h3 = true
+[routes.gemini.resolve]
+ipv6 = ["::1"]
+"#
+    );
+    let origins = Provider::ALL.map(|p| Origin::official(p).with_mock_port(destination.port()));
+    let running = fixture.run_origins(origins, false, false, "", &routes, "");
+    let (mut client, _driver) = client1(running.public_addr).await;
+    let request = Request::builder()
+        .uri("/gemini/v1beta/models")
+        .header(header::HOST, "localhost")
+        .header("x-goog-api-key", "mock-byok")
+        .body(body::empty())
+        .unwrap();
+    let res = timeout(Duration::from_secs(3), client.send_request(request))
+        .await
+        .unwrap()
+        .unwrap();
+    body_eq(res, StatusCode::OK).await;
+    let seen = upstream.seen().await;
+    assert_eq!(seen.headers[header::HOST], official);
+    assert_eq!(seen.tls_name.as_deref(), Some(official));
+    assert_eq!(seen.headers["x-goog-api-key"], "mock-byok");
+    assert_eq!(
+        running
+            .app
+            .config
+            .load()
+            .metrics
+            .values()
+            .map(|stats| stats.h3_fallbacks.load(Relaxed))
+            .sum::<u64>(),
+        0
+    );
+    assert!(shutdown(&running.app).await);
+    drop(task);
 }

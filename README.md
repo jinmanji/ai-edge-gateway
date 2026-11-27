@@ -12,7 +12,7 @@
 s=$(curl -fsS -H 'Accept: application/vnd.github.raw+json' 'https://api.github.com/repos/jinmanji/ai-edge-gateway/contents/scripts/quick-start.sh?ref=main') && sh -c "$s"
 ```
 
-[启动脚本](scripts/quick-start.sh)自动选择对应架构的全静态 [v0.1.0](https://github.com/jinmanji/ai-edge-gateway/releases/tag/v0.1.0) 产物，校验 `SHA256SUMS` 后安装到 `${XDG_DATA_HOME:-$HOME/.local/share}/ai-edge-gateway`（可用环境变量 `AIEG_HOME` 改位置）。首次启动生成 `config.toml`，以后不会覆盖；启动前先校验配置。默认以前台方式运行，按 `Ctrl+C` 停止。
+[启动脚本](scripts/quick-start.sh)自动选择对应架构的全静态 [v0.2.0](https://github.com/jinmanji/ai-edge-gateway/releases/tag/v0.2.0) 产物，校验 `SHA256SUMS` 后安装到 `${XDG_DATA_HOME:-$HOME/.local/share}/ai-edge-gateway`（可用环境变量 `AIEG_HOME` 改位置）。首次启动生成 `config.toml`，以后不会覆盖；启动前先校验配置。默认以前台方式运行，按 `Ctrl+C` 停止。
 
 ### 原生 Termux：一行构建并启动
 
@@ -85,8 +85,8 @@ cd "$package"
 - 推荐先更新版本并提交，然后推送 `v` 开头的版本 tag。四个构建全部通过后，工作流创建草稿、上传四个 `.tar.gz` 与 `SHA256SUMS`、再发布草稿。这个顺序兼容不可变 Releases，不要求本机登录 `gh`。
 
   ```sh
-  git tag -a v0.1.0 -m 'Release v0.1.0'
-  git push origin refs/tags/v0.1.0
+  git tag -a v0.2.0 -m 'Release v0.2.0'
+  git push origin refs/tags/v0.2.0
   ```
 
 - 直接在网页发布 Release 也会触发构建并补齐附件；若启用了**不可变 Releases**，请使用上面的 tag 发布方式，因为附件不能在 Release 公布后添加。工作流从触发事件的 commit 编译，而不是从最新的 `main` 取代码。
@@ -133,6 +133,28 @@ ipv6_refresh_secs = 86400
 - **地址优先级。** 未配置的地址族继续查 DNS。配置 IPv6 列表就跳过该厂商的 AAAA；已成功下载的列表优先于 `ipv6` 静态数组或本地文件。新连接轮换、竞速尝试各家族最多 16 个候选；已有连接和在途流不会因列表刷新被切断。在 `v6_only` 下，如首次下载尚未成功且无种子地址，IPv6 请求会暂时返回上游连接错误。
 - **自动刷新。** 配置启用后在启动或 SIGHUP 后异步下载，默认每 24 小时更新一次；下载或校验失败，保留内存中上次有效的列表并约每分钟重试。列表来源是独立 HTTPS 请求，不带任何 API Key；只接受一行一个公网 IPv6（可有空行和 `#` 注释），不跟随重定向。下载通过 `dns_servers` 解析列表域名、使用系统路由，不受 Gemini 的出口配置或地址覆盖影响。
 - **离线/静态方式。** `[routes.gemini.resolve]` 支持 `ipv4 = ["..."]`、`ipv6 = ["..."]` 和 `ipv6_list_file = "gemini-ipv6.txt"`。需要跨进程重启保留一份列表，或部署环境不能访问 GitHub 时，可从可信渠道预下载 `valid_ips.txt`，将其放到 `config.toml` 同目录，作为初始种子或仅使用文件模式。更新本地文件后用 SIGHUP 重载。`--check` 校验配置与文件但不发网络请求。
+
+### 通过本机 HTTP 代理连接指定 IPv6
+
+如果 Gemini 必须通过本机代理，给 BYOK 出口设置 `http_proxy`，例如 `http://127.0.0.1:2080`。把下面设置合并进现有的出口和路由表：
+
+```toml
+[egress.gemini_v6]
+mode = "v6_only"
+local_v6 = "::"
+allow_wildcard = true
+http_proxy = "http://127.0.0.1:2080"
+
+[routes.gemini]
+byok_egress = "gemini_v6"
+
+[routes.gemini.resolve]
+ipv6 = ["2404:6800:4007:800::200a"] # 示例；选用代理当前可达的地址
+```
+
+网关向代理发 `CONNECT [IPv6]:443`，然后在隧道内用 Gemini 官方域名完成 TLS 校验。不用代理的 DNS，也不在 CONNECT 请求中发送 API Key。`mode` 只限制隧道**目标**地址族：连代理的是本机回环连接，实际互联网出口 IP 由代理决定，因此不与固定源 IP 的 Managed 模式混用。仅支持无代理认证的字面量回环 `http://` 地址。启用后上游只走 TCP（H2/H1.1），不会绕过代理走 QUIC 或直连；下游 HTTP/3 不受影响。`HTTPS_PROXY` 等环境变量不改变网关的路由。
+
+远端 IPv6 列表下载是独立的系统路由，不使用这个代理。如果列表下载本身也必须走代理，可先用 `curl --proxy http://127.0.0.1:2080` 下载 `valid_ips.txt`，再用 `ipv6_list_file` 引用。
 
 ## 多出口 IP（Linux）
 

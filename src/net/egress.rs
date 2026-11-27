@@ -15,7 +15,7 @@ use tokio::{
     time::{Instant, sleep_until, timeout},
 };
 
-use super::{dns::Dns, resolve::Overrides};
+use super::{connect::HttpConnect, dns::Dns, resolve::Overrides};
 use crate::{ConfigError, Result};
 
 #[derive(Clone, Copy, Deserialize)]
@@ -54,12 +54,14 @@ pub struct EgressSpec {
     pub interface: Option<String>,
     #[serde(default)]
     pub allow_wildcard: bool,
+    pub http_proxy: Option<String>,
 }
 
 pub struct Egress {
     pub name: Arc<str>,
     spec: EgressSpec,
     dns: Arc<Dns>,
+    proxy: Option<HttpConnect>,
 }
 
 impl Egress {
@@ -86,11 +88,34 @@ impl Egress {
         {
             return Err("invalid egress interface name".into());
         }
+        let proxy = spec
+            .http_proxy
+            .as_deref()
+            .map(HttpConnect::parse)
+            .transpose()?;
+        if proxy.is_some()
+            && (!spec.allow_wildcard
+                || spec.interface.is_some()
+                || spec.freebind
+                || spec.local_v4.is_some_and(|ip| !ip.is_unspecified())
+                || spec.local_v6.is_some_and(|ip| !ip.is_unspecified()))
+        {
+            return Err(ConfigError(format!(
+                "egress {name}: http_proxy uses the proxy's outbound IP; enable allow_wildcard, use 0.0.0.0/:: and remove interface/freebind"
+            )));
+        }
         let this = Self {
             name: name.into(),
             spec,
             dns,
+            proxy,
         };
+        if this.has_http_proxy() {
+            // These families now select destination addresses, not sockets on
+            // this host. An IPv4 loopback proxy can dial IPv6 even if this
+            // host does not have a usable IPv6 interface.
+            return Ok(this);
+        }
         // Linux can globally permit nonlocal binds. Verify interface membership
         // separately, so an omitted freebind flag does not silently inherit that
         // sysctl. Android apps may be unable to enumerate interfaces via netlink.
@@ -154,6 +179,10 @@ impl Egress {
             }
         }
         Ok(this)
+    }
+
+    pub(crate) fn has_http_proxy(&self) -> bool {
+        self.proxy.is_some()
     }
 
     pub fn fixed(&self) -> bool {
@@ -220,6 +249,9 @@ impl Egress {
         let local = self
             .local(remote.is_ipv6())
             .ok_or_else(|| io::Error::other("address family disabled"))?;
+        if let Some(proxy) = self.proxy {
+            return proxy.tunnel(remote).await;
+        }
         let socket = self.bind(local, false)?;
         tokio::net::TcpSocket::from_std_stream(socket.into())
             .connect(remote)
@@ -227,6 +259,12 @@ impl Egress {
     }
 
     pub fn endpoints(&self) -> io::Result<[Option<quinn::Endpoint>; 2]> {
+        if self.has_http_proxy() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "HTTP CONNECT does not transport QUIC",
+            ));
+        }
         let open = |v6| -> io::Result<Option<quinn::Endpoint>> {
             self.local(v6)
                 .map(|local| {
@@ -370,6 +408,7 @@ mod tests {
             freebind: false,
             interface: None,
             allow_wildcard: false,
+            http_proxy: None,
         }
     }
 

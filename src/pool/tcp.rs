@@ -51,7 +51,7 @@ pub fn client(
         .http2_keep_alive_interval(Duration::from_secs(25))
         .http2_keep_alive_timeout(Duration::from_secs(10))
         .http2_keep_alive_while_idle(true)
-        .set_host(false)
+        .set_host(true)
         .build(Connector {
             egress,
             tls: tls.map(|t| t.map(TlsConnector::from)),
